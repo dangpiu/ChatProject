@@ -1,127 +1,198 @@
-#define _WIN32_WINNT 0x0600
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <cstring>
-#include <fstream>
 #include <thread>
-#include <chrono>
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include <vector>
+#include <algorithm>
 
-#pragma comment(lib, "ws2_32.lib")
+// --- PREPROCESSOR CONDITIONAL COMPILATION ---
+#if defined(_WIN32) || defined(WIN32)
+    #define PLATFORM_WINDOWS 1
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    typedef SOCKET SocketType;
+    #define CLOSE_SOCKET(s) closesocket(s)
+    #define INVALID_SOCKET_VAL INVALID_SOCKET
+#else
+    #define PLATFORM_WINDOWS 0
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <netdb.h>
+    typedef int SocketType;
+    #define CLOSE_SOCKET(s) close(s)
+    #define INVALID_SOCKET_VAL -1
+#endif
 
-const int PORT = 8080;
-const int BUFFER_SIZE = 1024;
-const char* SERVER_IP = "127.0.0.1"; // Change to your exact Ubuntu IP address!
+#define PORT 8080
+#define BUFFER_SIZE 4096
+#define FILE_MARKER "__FILE_TRANSFER__:"
 
-void receive_file(SOCKET server_socket, const std::string& filename, long long filesize) {
-    std::ofstream outfile(filename, std::ios::binary);
-    if (!outfile.is_open()) {
-        std::cerr << "Error: Could not open output file file." << std::endl;
+bool running = true;
+
+// --- UTILITY FUNCTIONS ---
+void initialize_network() {
+#if PLATFORM_WINDOWS
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "[-] Winsock initialization failed.\n";
+        exit(EXIT_FAILURE);
+    }
+#endif
+}
+
+void cleanup_network() {
+#if PLATFORM_WINDOWS
+    WSACleanup();
+#endif
+}
+
+// --- FILE TRANSFER LOGIC ---
+void send_file(SocketType sock, const std::string& filepath) {
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "[-] Error: Cannot open file " << filepath << "\n";
         return;
     }
 
-    char buffer[BUFFER_SIZE];
-    long long total_bytes_received = 0;
-    std::cout << "\n[System] Receiving file: " << filename << " (" << filesize << " bytes)..." << std::endl;
+    std::streamsize filesize = file.tellg();
+    file.seekg(0, std::ios::beg);
 
-    while (total_bytes_received < filesize) {
-        int bytes_to_read = std::min((long long)BUFFER_SIZE, filesize - total_bytes_received);
-        int bytes_received = recv(server_socket, buffer, bytes_to_read, 0);
-        if (bytes_received <= 0) {
-            std::cerr << "Connection interrupted!" << std::endl;
-            break;
-        }
-        outfile.write(buffer, bytes_received);
-        total_bytes_received += bytes_received;
+    std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
+    std::string header = std::string(FILE_MARKER) + filename + "|" + std::to_string(filesize);
+    send(sock, header.c_str(), header.length(), 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    std::vector<char> buffer(BUFFER_SIZE);
+    std::cout << "[+] Sending file: " << filename << " (" << filesize << " bytes)...\n";
+    
+    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
+        send(sock, buffer.data(), file.gcount(), 0);
     }
-    outfile.close();
-    std::cout << "[System] File transfer complete!\nClient: " << std::flush;
+    
+    file.close();
+    std::cout << "[+] File sent successfully!\n";
 }
 
-void receive_messages(SOCKET server_socket) {
-    char buffer[BUFFER_SIZE];
-    while (true) {
-        std::memset(buffer, 0, BUFFER_SIZE);
-        int bytes_received = recv(server_socket, buffer, BUFFER_SIZE, 0);
+void receive_file(SocketType sock, const std::string& header_info) {
+    size_t delimiter = header_info.find('|');
+    if (delimiter == std::string::npos) return;
+
+    std::string filename = "client_received_" + header_info.substr(0, delimiter);
+    long long filesize = std::stoll(header_info.substr(delimiter + 1));
+
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[-] Failed to create local file: " << filename << "\n";
+        return;
+    }
+
+    std::cout << "\n[+] Receiving file: " << filename << " [" << filesize << " bytes]\n";
+    std::vector<char> buffer(BUFFER_SIZE);
+    long long total_received = 0;
+
+    while (total_received < filesize) {
+        int bytes_to_read = std::min((long long)BUFFER_SIZE, filesize - total_received);
+        int bytes_received = recv(sock, buffer.data(), bytes_to_read, 0);
+        if (bytes_received <= 0) break;
+
+        file.write(buffer.data(), bytes_received);
+        total_received += bytes_received;
+    }
+
+    file.close();
+    std::cout << "[+] File saved successfully as: " << filename << "\n>> " << std::flush;
+}
+
+// --- BACKGROUND RECEIVER ---
+void handle_receiving(SocketType sock) {
+    std::vector<char> buffer(BUFFER_SIZE);
+    while (running) {
+        std::memset(buffer.data(), 0, BUFFER_SIZE);
+        int bytes_received = recv(sock, buffer.data(), BUFFER_SIZE - 1, 0);
+
         if (bytes_received <= 0) {
-            std::cout << "\n[System] Connection lost from server." << std::endl;
+            std::cout << "\n[-] Server disconnected.\n";
+            running = false;
             break;
         }
 
-        std::string incoming_data(buffer, bytes_received);
-
-        if (incoming_data.rfind("FILE_HEADER:", 0) == 0) {
-            size_t first_colon = incoming_data.find(':', 12);
-            std::string filename = incoming_data.substr(12, first_colon - 12);
-            long long filesize = std::stoll(incoming_data.substr(first_colon + 1));
-            
-            receive_file(server_socket, filename, filesize);
+        std::string msg(buffer.data(), bytes_received);
+        
+        if (msg.rfind(FILE_MARKER, 0) == 0) {
+            std::string header_info = msg.substr(std::strlen(FILE_MARKER));
+            receive_file(sock, header_info);
         } else {
-            std::cout << "\n[Ubuntu Server]: " << incoming_data << "\nClient: " << std::flush;
+            std::cout << "\nServer: " << msg << "\n>> " << std::flush;
         }
     }
 }
 
+// --- MAIN CLIENT EXECUTION ---
 int main() {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return 1;
+    initialize_network();
 
-    SOCKET client_socket = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in server_addr;
-    std::memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+    std::cout << "====================================================\n";
+    std::cout << "        CLIENT NODE (CROSS-PLATFORM JOIN)          \n";
+    std::cout << "====================================================\n";
 
-    std::cout << "Connecting to server..." << std::endl;
-    if (connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        std::cerr << "Connection failed!" << std::endl;
-        WSACleanup();
+    std::cout << "Enter Server IP Address to connect: ";
+    std::string ip_address;
+    std::getline(std::cin, ip_address);
+
+    SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET_VAL) {
+        std::cerr << "[-] Socket creation error.\n";
+        cleanup_network();
         return 1;
     }
 
-    std::cout << "Connected to Ubuntu Server! Start chatting." << std::endl;
-    std::cout << "To send a file, type: /sendfile [path_to_file]" << std::endl;
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+    
+    if (inet_pton(AF_INET, ip_address.c_str(), &serv_addr.sin_addr) <= 0) {
+        std::cerr << "[-] Invalid address configuration/ Address not supported.\n";
+        CLOSE_SOCKET(sock);
+        cleanup_network();
+        return 1;
+    }
 
-    std::thread rx_thread(receive_messages, client_socket);
-    rx_thread.detach();
+    std::cout << "[*] Connecting to server at " << ip_address << ":" << PORT << "...\n";
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        std::cerr << "[-] Connection handshake failed.\n";
+        CLOSE_SOCKET(sock);
+        cleanup_network();
+        return 1;
+    }
+    std::cout << "[+] Connected to Server!\n\n";
+    std::cout << "* Type messages normally and press Enter.\n";
+    std::cout << "* Use '/sendfile <path>' to transfer files.\n";
+    std::cout << "* Type 'exit' to quit.\n----------------------------------------------------\n";
 
-    std::string out_message;
-    while (true) {
-        std::cout << "Client: ";
-        std::getline(std::cin, out_message);
-        if (out_message.empty()) continue;
+    std::thread rx_thread(handle_receiving, sock);
 
-        if (out_message.rfind("/sendfile ", 0) == 0) {
-            std::string filepath = out_message.substr(10);
-            std::ifstream infile(filepath, std::ios::binary | std::ios::ate);
-            if (!infile.is_open()) {
-                std::cerr << "File could not be opened!" << std::endl;
-                continue;
-            }
-            long long filesize = infile.tellg();
-            infile.seekg(0, std::ios::beg);
+    std::string input;
+    while (running) {
+        std::cout << ">> ";
+        std::getline(std::cin, input);
+        if (input == "exit") { running = false; break; }
 
-            std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
-            std::string header = "FILE_HEADER:" + filename + ":" + std::to_string(filesize);
-            send(client_socket, header.c_str(), header.length(), 0);
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            char file_buffer[BUFFER_SIZE];
-            while (!infile.eof()) {
-                infile.read(file_buffer, BUFFER_SIZE);
-                send(client_socket, file_buffer, infile.gcount(), 0);
-            }
-            infile.close();
-            std::cout << "[System] File sent successfully!" << std::endl;
-        } else {
-            send(client_socket, out_message.c_str(), out_message.length(), 0);
+        if (input.rfind("/sendfile ", 0) == 0) {
+            std::string path = input.substr(10);
+            send_file(sock, path);
+        } else if (!input.empty()) {
+            send(sock, input.c_str(), input.length(), 0);
         }
     }
 
-    closesocket(client_socket);
-    WSACleanup();
+    if (rx_thread.joinable()) rx_thread.join();
+    
+    CLOSE_SOCKET(sock);
+    cleanup_network();
+    std::cout << "[+] Client closed cleanly.\n";
     return 0;
 }
