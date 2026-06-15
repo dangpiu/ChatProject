@@ -1,198 +1,198 @@
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <cstring>
-#include <thread>
-#include <vector>
-#include <algorithm>
+// =====================================================================
+//  client.cpp  -  Cross-platform chat client (Linux <-> Windows)
+// =====================================================================
+//  Compile on Linux:
+//      g++ -std=c++17 -pthread client.cpp -o client
+//
+//  Compile on Windows (MinGW-w64 g++):
+//      g++ -std=c++17 client.cpp -o client.exe -lws2_32
+//
+//  Run (replace with the SERVER's IP address):
+//      ./client 192.168.1.10        (Linux)
+//      client.exe 192.168.1.10      (Windows)
+//
+//  Once connected, both sides can chat in real time and send files
+//  using:
+//      /sendfile <path>     -> send a file to the other side
+//      /quit                -> end the chat session
+// =====================================================================
 
-// --- PREPROCESSOR CONDITIONAL COMPILATION ---
-#if defined(_WIN32) || defined(WIN32)
-    #define PLATFORM_WINDOWS 1
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
-    typedef SOCKET SocketType;
-    #define CLOSE_SOCKET(s) closesocket(s)
-    #define INVALID_SOCKET_VAL INVALID_SOCKET
-#else
-    #define PLATFORM_WINDOWS 0
-    #include <sys/socket.h>
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    #include <netdb.h>
-    typedef int SocketType;
-    #define CLOSE_SOCKET(s) close(s)
-    #define INVALID_SOCKET_VAL -1
-#endif
+#include "common.h"
 
-#define PORT 8080
-#define BUFFER_SIZE 4096
-#define FILE_MARKER "__FILE_TRANSFER__:"
+bool running = true;   // shared flag used to stop both threads cleanly
 
-bool running = true;
+void receiveLoop(SOCKET sock);
+void sendLoop(SOCKET sock);
 
-// --- UTILITY FUNCTIONS ---
-void initialize_network() {
-#if PLATFORM_WINDOWS
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "[-] Winsock initialization failed.\n";
-        exit(EXIT_FAILURE);
+int main(int argc, char* argv[]) {
+    // ---- Winsock initialisation (no-op on Linux) ----
+    if (!initWinsock()) return 1;
+
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <server_ip_address>\n";
+        cleanupWinsock();
+        return 1;
     }
-#endif
+    std::string serverIP = argv[1];
+
+    // -----------------------------------------------------------------
+    // 1) socket() - create an endpoint for communication (TCP/IPv4).
+    // -----------------------------------------------------------------
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        std::cerr << "[!] socket() failed\n";
+        cleanupWinsock();
+        return 1;
+    }
+
+    // -----------------------------------------------------------------
+    // Build the server's address structure.
+    //    htons()    converts the port number to network byte order.
+    //    inet_pton() converts a dotted-decimal IP string (e.g.
+    //                "192.168.1.10") into the binary form required
+    //                by the socket API. Works identically on Linux
+    //                and Windows.
+    // -----------------------------------------------------------------
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port   = htons(PORT);
+
+    if (inet_pton(AF_INET, serverIP.c_str(), &serverAddr.sin_addr) <= 0) {
+        std::cerr << "[!] Invalid server IP address: " << serverIP << "\n";
+        closesocket(sock);
+        cleanupWinsock();
+        return 1;
+    }
+
+    // -----------------------------------------------------------------
+    // 2) connect() - actively establish a TCP connection to the server
+    //    identified by serverAddr (the 3-way handshake happens here).
+    // -----------------------------------------------------------------
+    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "[!] connect() failed - is the server running and reachable?\n";
+        closesocket(sock);
+        cleanupWinsock();
+        return 1;
+    }
+
+    std::cout << "[+] Connected to server " << serverIP << ":" << PORT << "\n";
+    std::cout << "Type a message and press Enter to chat.\n";
+    std::cout << "Use /sendfile <path> to send a file, or /quit to end the chat.\n\n";
+
+    // -----------------------------------------------------------------
+    // Run sending and receiving on separate threads so messages/files
+    // can arrive WHILE the user is typing (full-duplex, real-time chat).
+    // -----------------------------------------------------------------
+    std::thread tRecv(receiveLoop, sock);
+    std::thread tSend(sendLoop, sock);
+
+    tRecv.join();
+    tSend.join();
+
+    // -----------------------------------------------------------------
+    // 3) closesocket()/close() - release the socket resources.
+    // -----------------------------------------------------------------
+    closesocket(sock);
+    cleanupWinsock();
+    return 0;
 }
 
-void cleanup_network() {
-#if PLATFORM_WINDOWS
-    WSACleanup();
-#endif
-}
-
-// --- FILE TRANSFER LOGIC ---
-void send_file(SocketType sock, const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cerr << "[-] Error: Cannot open file " << filepath << "\n";
-        return;
-    }
-
-    std::streamsize filesize = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
-    std::string header = std::string(FILE_MARKER) + filename + "|" + std::to_string(filesize);
-    send(sock, header.c_str(), header.length(), 0);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    std::vector<char> buffer(BUFFER_SIZE);
-    std::cout << "[+] Sending file: " << filename << " (" << filesize << " bytes)...\n";
-    
-    while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
-        send(sock, buffer.data(), file.gcount(), 0);
-    }
-    
-    file.close();
-    std::cout << "[+] File sent successfully!\n";
-}
-
-void receive_file(SocketType sock, const std::string& header_info) {
-    size_t delimiter = header_info.find('|');
-    if (delimiter == std::string::npos) return;
-
-    std::string filename = "client_received_" + header_info.substr(0, delimiter);
-    long long filesize = std::stoll(header_info.substr(delimiter + 1));
-
-    std::ofstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "[-] Failed to create local file: " << filename << "\n";
-        return;
-    }
-
-    std::cout << "\n[+] Receiving file: " << filename << " [" << filesize << " bytes]\n";
-    std::vector<char> buffer(BUFFER_SIZE);
-    long long total_received = 0;
-
-    while (total_received < filesize) {
-        int bytes_to_read = std::min((long long)BUFFER_SIZE, filesize - total_received);
-        int bytes_received = recv(sock, buffer.data(), bytes_to_read, 0);
-        if (bytes_received <= 0) break;
-
-        file.write(buffer.data(), bytes_received);
-        total_received += bytes_received;
-    }
-
-    file.close();
-    std::cout << "[+] File saved successfully as: " << filename << "\n>> " << std::flush;
-}
-
-// --- BACKGROUND RECEIVER ---
-void handle_receiving(SocketType sock) {
-    std::vector<char> buffer(BUFFER_SIZE);
+// =====================================================================
+// receiveLoop()
+// Continuously waits for framed messages from the server and either:
+//   - prints chat text, or
+//   - receives and saves an incoming file, or
+//   - stops the program if the server sent /quit or disconnected.
+// =====================================================================
+void receiveLoop(SOCKET sock) {
     while (running) {
-        std::memset(buffer.data(), 0, BUFFER_SIZE);
-        int bytes_received = recv(sock, buffer.data(), BUFFER_SIZE - 1, 0);
-
-        if (bytes_received <= 0) {
-            std::cout << "\n[-] Server disconnected.\n";
+        uint8_t type;
+        if (!recvAll(sock, (char*)&type, 1)) {
+            std::cout << "\n[!] Connection closed by peer.\n";
             running = false;
             break;
         }
 
-        std::string msg(buffer.data(), bytes_received);
-        
-        if (msg.rfind(FILE_MARKER, 0) == 0) {
-            std::string header_info = msg.substr(std::strlen(FILE_MARKER));
-            receive_file(sock, header_info);
-        } else {
-            std::cout << "\nServer: " << msg << "\n>> " << std::flush;
+        if (type == MSG_TEXT) {
+            uint32_t lenNet;
+            if (!recvAll(sock, (char*)&lenNet, 4)) { running = false; break; }
+            uint32_t len = ntohl(lenNet);
+
+            std::string text(len, '\0');
+            if (len > 0 && !recvAll(sock, &text[0], len)) { running = false; break; }
+
+            std::cout << "\n[Server]: " << text << "\nYou: ";
+            std::cout.flush();
+        }
+        else if (type == MSG_FILE) {
+            // ---- read filename ----
+            uint32_t nameLenNet;
+            if (!recvAll(sock, (char*)&nameLenNet, 4)) { running = false; break; }
+            uint32_t nameLen = ntohl(nameLenNet);
+
+            std::string filename(nameLen, '\0');
+            if (nameLen > 0 && !recvAll(sock, &filename[0], nameLen)) { running = false; break; }
+
+            // ---- read file size ----
+            uint32_t sizeNet;
+            if (!recvAll(sock, (char*)&sizeNet, 4)) { running = false; break; }
+            uint32_t fileSize = ntohl(sizeNet);
+
+            std::cout << "\n[*] Receiving file '" << filename << "' (" << fileSize << " bytes)...\n";
+
+            // ---- read file data and write to disk ----
+            std::string outName = "received_" + filename;
+            std::ofstream outFile(outName, std::ios::binary);
+            char buffer[BUFFER_SIZE];
+            uint32_t remaining = fileSize;
+            while (remaining > 0) {
+                size_t chunk = (remaining > (uint32_t)BUFFER_SIZE) ? (size_t)BUFFER_SIZE : remaining;
+                if (!recvAll(sock, buffer, chunk)) { running = false; break; }
+                outFile.write(buffer, chunk);
+                remaining -= (uint32_t)chunk;
+            }
+            outFile.close();
+
+            std::cout << "[+] File saved as '" << outName << "'\nYou: ";
+            std::cout.flush();
+        }
+        else if (type == MSG_QUIT) {
+            std::cout << "\n[!] Server ended the chat session.\n";
+            running = false;
+            break;
         }
     }
 }
 
-// --- MAIN CLIENT EXECUTION ---
-int main() {
-    initialize_network();
-
-    std::cout << "====================================================\n";
-    std::cout << "        CLIENT NODE (CROSS-PLATFORM JOIN)          \n";
-    std::cout << "====================================================\n";
-
-    std::cout << "Enter Server IP Address to connect: ";
-    std::string ip_address;
-    std::getline(std::cin, ip_address);
-
-    SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET_VAL) {
-        std::cerr << "[-] Socket creation error.\n";
-        cleanup_network();
-        return 1;
-    }
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-    
-    if (inet_pton(AF_INET, ip_address.c_str(), &serv_addr.sin_addr) <= 0) {
-        std::cerr << "[-] Invalid address configuration/ Address not supported.\n";
-        CLOSE_SOCKET(sock);
-        cleanup_network();
-        return 1;
-    }
-
-    std::cout << "[*] Connecting to server at " << ip_address << ":" << PORT << "...\n";
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::cerr << "[-] Connection handshake failed.\n";
-        CLOSE_SOCKET(sock);
-        cleanup_network();
-        return 1;
-    }
-    std::cout << "[+] Connected to Server!\n\n";
-    std::cout << "* Type messages normally and press Enter.\n";
-    std::cout << "* Use '/sendfile <path>' to transfer files.\n";
-    std::cout << "* Type 'exit' to quit.\n----------------------------------------------------\n";
-
-    std::thread rx_thread(handle_receiving, sock);
-
-    std::string input;
+// =====================================================================
+// sendLoop()
+// Reads lines typed by the client's user and sends them to the server.
+//   - "/sendfile <path>" triggers a file transfer
+//   - "/quit"            ends the session for both sides
+//   - anything else      is sent as a plain chat message
+// =====================================================================
+void sendLoop(SOCKET sock) {
+    std::string line;
     while (running) {
-        std::cout << ">> ";
-        std::getline(std::cin, input);
-        if (input == "exit") { running = false; break; }
+        std::cout << "You: ";
+        if (!std::getline(std::cin, line)) {   // e.g. Ctrl+D / Ctrl+Z
+            sendQuit(sock);
+            running = false;
+            break;
+        }
 
-        if (input.rfind("/sendfile ", 0) == 0) {
-            std::string path = input.substr(10);
-            send_file(sock, path);
-        } else if (!input.empty()) {
-            send(sock, input.c_str(), input.length(), 0);
+        if (!running) break;
+
+        if (line == "/quit") {
+            sendQuit(sock);
+            running = false;
+        }
+        else if (line.rfind("/sendfile ", 0) == 0) {
+            std::string path = line.substr(10); // text after "/sendfile "
+            sendFileMsg(sock, path);
+        }
+        else if (!line.empty()) {
+            if (!sendText(sock, line)) running = false;
         }
     }
-
-    if (rx_thread.joinable()) rx_thread.join();
-    
-    CLOSE_SOCKET(sock);
-    cleanup_network();
-    std::cout << "[+] Client closed cleanly.\n";
-    return 0;
 }
